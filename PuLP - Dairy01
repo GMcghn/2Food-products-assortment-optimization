@@ -1,0 +1,922 @@
+# Databricks notebook source		
+
+# imports		
+		
+		
+dbutils.library.installPyPI("pulp")		
+dbutils.library.installPyPI("numpy")		
+dbutils.library.installPyPI("plotly")		
+dbutils.library.installPyPI("spark-df-profiling")		
+dbutils.library.installPyPI("Annoy")		
+dbutils.library.installPyPI("gensim")		
+		
+dbutils.library.installPyPI("docplex")		
+dbutils.library.installPyPI("cplex")		
+		
+dbutils.library.restartPython() # Removes Python state, but some libraries might not work without calling this function		
+		
+import matplotlib.pyplot as plt		
+		
+# COMMAND ----------		
+		
+# dbutils.widgets.removeAll()		
+		
+# COMMAND ----------		
+		
+# CHANGE PART IF NEW ELEMENT IN FORMULA		
+#widgets		
+import datetime		
+		
+today = datetime.date.today()		
+current_year = today.year		
+current_month = today.month		
+		
+# dbutils.widgets.dropdown("end_year", str(current_year), [str(x) for x in range(2017, current_year+1)])		
+# dbutils.widgets.dropdown("end_month", "12", [str(x) for x in range(1, 13)])		
+# dbutils.widgets.dropdown("start_year", "2017", [str(x) for x in range(2017, current_year+1)])		
+# dbutils.widgets.dropdown("start_month", "1", [str(x) for x in range(1, 13)])		
+		
+# dbutils.widgets.get("x123123")		
+# print(getArgument("x123123"))		
+# print(dbutils.widgets.get("x123123"))		
+# dbutils.widgets.remove("start year")		
+		
+# dbutils.widgets.text("w1", "1")		
+# dbutils.widgets.text("w2", "1")		
+# dbutils.widgets.text("w3", "1")		
+# dbutils.widgets.text("w4", "1")		
+		
+w1 = int(dbutils.widgets.get("w1"))		
+w2 = int(dbutils.widgets.get("w2"))		
+w3 = int(dbutils.widgets.get("w3"))		
+w4 = int(dbutils.widgets.get("w4"))		
+		
+# COMMAND ----------		
+		
+w4		
+		
+# COMMAND ----------		
+		
+# MAGIC %md IMPORT DATA FROM DATALAKE		
+		
+# COMMAND ----------		
+		
+from pyspark.sql.functions import spark_partition_id, col, to_date		
+from pyspark.sql.types import *		
+		
+# DEV part only on 1 month		
+		
+# .filter('Month = 3 AND Year = 2019')		
+# si = spark.read.csv("mnt/gen2/prod/Prepared/Reporting/Facts/ScannedItem/Year=2019/*/*/FactScannedItem.csv", header="true", inferSchema="false", sep = ",")		
+# si = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Facts/ScannedItem/").filter('Month IN (3,4,5) AND Year = 2019')		
+si = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Facts/ScannedItem/").filter('Month = 1 AND Year = 2020')		
+		
+# change date column format from string to date		
+si = si.withColumn('dl_emission_date_id', to_date(col('dl_emission_date_id'), "yyyyMMdd"))		
+		
+# make the dataframe queriable as a temporary view		
+si.createOrReplaceTempView('si')		
+display(si)		
+		
+# COMMAND ----------		
+		
+store = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Dimensions/DimStore.csv")		
+		
+# make the dataframe queriable as a temporary view		
+store.createOrReplaceTempView('store')		
+		
+display(store)		
+		
+# COMMAND ----------		
+		
+customer = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Dimensions/DimCustomer.csv")		
+# make the dataframe queriable as a temporary view		
+customer.createOrReplaceTempView('customer')		
+display(customer)		
+		
+# COMMAND ----------		
+		
+similarities = spark.read.format('csv').options(header=True, inferSchema= False, sep = "\t").load("mnt/DataScience/sandbox/sbenho/substitutes_10.csv")		
+# make the dataframe queriable as a temporary view		
+similarities.createOrReplaceTempView('similarities')		
+display(similarities)		
+		
+# COMMAND ----------		
+		
+article = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Dimensions/DimArticle.csv")		
+# make the dataframe queriable as a temporary view		
+article.createOrReplaceTempView('article')		
+display(article)		
+		
+# COMMAND ----------		
+		
+cv = spark.read.option("header",True).csv('/mnt/gen2/prod/DataScience/projects/articleCustomerValue/Year=2020/Month=3/')		
+cv.createOrReplaceTempView('cv')		
+display(cv)		
+		
+# COMMAND ----------		
+		
+# %sql		
+# -- spotcheck similarity		
+# SELECT article_number, article_name, substitute, substitute_name, similarity, catDist		
+# from similarities		
+# WHERE 		
+# article_number = 'F2001121200573700000'		
+		
+# COMMAND ----------		
+		
+# MAGIC %md PREPARE DATASET		
+		
+# COMMAND ----------		
+		
+  # build pandas df from sql statement		
+		
+# microsegment_hierarchy_number: concatenation of category, subcategory, segment, subsegment and microsegment names ( where  meaningful) -- unreliable column not well completed		
+# ecommerce_availability_code: 0 : Not available in ecommerce (Stores only) 1: Exclusivity of ecommerce 2: Available through ecommerce and in stores -- unreliable column not well updated 		
+# we take revenue rather than profit becasue more reliable		
+		
+sql_statement = """		
+SELECT 		
+  		
+  a.article_number,		
+  a.article_name,		
+  a.online_name_fr,		
+  		
+  a.sm_department_name,		
+  a.category_name,		
+  a.subcategory_syllab,		
+  a.segment_syllab,		
+  a.subsegment_syllab,		
+  a.microsegment_syllab,		
+  		
+  SUM(si.number_of_items) AS quantity, 		
+  SUM(si.total_item_amount) AS revenue,		
+  COUNT(si.dl_emitted_ticket_id) AS count_tickets,		
+  COUNT(DISTINCT c.customer_hash) AS distinct_count_customer,		
+  cv.customerValueSUBCAT,		
+  cv.customerValueSEGM		
+  		
+FROM 		
+  si AS si 		
+  INNER JOIN store AS s 		
+    ON si.sap_site_identifier = s.sap_site_identifier 		
+  INNER JOIN article AS a 		
+    ON si.hope_number = a.hope_number AND si.article_number = a.article_number		
+  LEFT JOIN customer as c		
+    ON si.customer_hash = c.customer_hash		
+  LEFT JOIN cv		
+    ON si.hope_number = cv.hope_number AND si.article_number = cv.article_number		
+		
+WHERE 		
+   		
+  --s.business_model_name = 'Integrated' AND           --non franchise stores 		
+  --s.store_number = '140007' AND                     -- one store (big one) selected as a baseline . 140007 home delivery  		
+  --a.category_name = 'CHEESE' AND		
+  a.sm_department_name = 'DAIRY' AND     		
+  --si.is_ecommerce = 'Y'		
+  (a.status_code = '0' OR a.is_deleted = 'N')		
+  		
+  -- AND a.category_name = 'ALCOHOLS' -- for DEV part		
+  -- AND si.dl_emission_date_id = datefromparts(getArgument(start_year), getArgument(start_month), 1)  		
+    --BETWEEN XXX AND DATEFROMPARTS(getArgument(end_year), getArgument(end_month), 1)		
+  		
+		
+GROUP BY		
+   		
+  a.article_number,		
+  a.article_name,		
+  a.online_name_fr,		
+  		
+  a.sm_department_name,		
+  a.category_name,		
+  a.subcategory_syllab,		
+  a.segment_syllab,		
+  a.subsegment_syllab,		
+  a.microsegment_syllab,		
+  		
+  cv.customerValueSUBCAT,		
+  cv.customerValueSEGM		
+		
+"""
+
+print(spark.sql(sql_statement).count())
+
+
+# assemble dataset in Pandas dataframe
+df_spark = spark.sql(sql_statement)
+df_spark.createOrReplaceTempView('df_spark')
+# display(df_spark)
+df_pandas = df_spark.toPandas()
+
+df_pandas.dropna(how='all', inplace=True)
+
+# df_pandas.head()
+
+# COMMAND ----------
+
+# df_pandas.dtypes
+
+# COMMAND ----------
+
+# GET THE ECOMMERCE ASSORTMENT AND ITS SIZE
+sql_ecommerce_current = """		
+SELECT 		
+  		
+  a.article_number,		
+  a.article_name,		
+  a.online_name_fr,		
+  		
+  a.sm_department_name,		
+  a.category_name,		
+  a.subcategory_syllab,		
+  a.segment_syllab,		
+  a.subsegment_syllab,		
+  a.microsegment_syllab,		
+  		
+  SUM(si.number_of_items) AS quantity, 		
+  SUM(si.total_item_amount) AS revenue,		
+  COUNT(si.dl_emitted_ticket_id) AS count_tickets,		
+  COUNT(DISTINCT c.customer_hash) AS distinct_count_customer,		
+  cv.customerValueSUBCAT,		
+  cv.customerValueSEGM		
+  		
+FROM 		
+  si AS si 		
+  INNER JOIN store AS s 		
+    ON si.sap_site_identifier = s.sap_site_identifier 		
+  INNER JOIN article AS a 		
+    ON si.hope_number = a.hope_number AND si.article_number = a.article_number		
+  LEFT JOIN customer as c		
+    ON si.customer_hash = c.customer_hash		
+  LEFT JOIN cv		
+    ON si.hope_number = cv.hope_number AND si.article_number = cv.article_number		
+		
+WHERE 		
+   		
+  --s.business_model_name = 'Integrated' AND            --non franchise stores 		
+  --s.store_number = '140007' AND                 -- one store (big one) selected as a baseline. 140007 home delivery  		
+  --a.category_name = 'CHEESE' AND                 		
+  a.sm_department_name = 'DAIRY' AND		
+  si.is_ecommerce = 'Y' AND		
+  (a.status_code = '0' OR a.is_deleted = 'N')		
+  		
+  -- AND a.category_name = 'ALCOHOLS' -- for DEV part		
+  -- AND si.dl_emission_date_id = datefromparts(getArgument(start_year), getArgument(start_month), 1)  		
+    --BETWEEN XXX AND DATEFROMPARTS(getArgument(end_year), getArgument(end_month), 1)		
+  		
+		
+GROUP BY		
+   		
+  a.article_number,		
+  a.article_name,		
+  a.online_name_fr,		
+  		
+  a.sm_department_name,		
+  a.category_name,		
+  a.subcategory_syllab,		
+  a.segment_syllab,		
+  a.subsegment_syllab,		
+  a.microsegment_syllab,		
+  		
+  cv.customerValueSUBCAT,		
+  cv.customerValueSEGM		
+		
+"""
+
+
+
+
+df_ecommerce_current = spark.sql(sql_ecommerce_current)
+df_ecommerce_current.createOrReplaceTempView('df_ecommerce_current')
+size_ecomm = df_ecommerce_current.count()
+print(size_ecomm) 
+
+# COMMAND ----------
+
+# display(df_ecommerce_current)
+
+# COMMAND ----------
+
+# MAGIC %md DOUBLE ENTRY TABLE GENSIM ETC
+
+# COMMAND ----------
+
+from gensim.test.utils import datapath, get_tmpfile
+from gensim.models import KeyedVectors
+from gensim.scripts.glove2word2vec import glove2word2vec
+import pandas as pd
+
+# COMMAND ----------
+
+# get cpdna file without client numbers from Raf sandbox (in the future build the file in the notebook) 
+glovePath=/mnt/DataScience/sandbox/rmat/MetaSimilarity/cpdna_glove.csv"" #enlever partie dbfs parfois dans les path, parfois pas"		
+		
+file = spark.read.format('csv').options(sep = " ").load(glovePath)		
+file.createOrReplaceTempView('file')		
+file.count() # 301 columns, 89.843 lines		
+		
+# COMMAND ----------		
+		
+# df Cheese		
+sql_statement_gensim = """		
+SELECT file.*		
+		
+FROM 		
+  file  		
+  INNER JOIN  		
+    		
+  df_spark		
+  ON file._c0 = df_spark.article_number		
+  WHERE		
+  --df_spark.category_name = 'CHEESE' AND		
+  df_spark.sm_department_name = 'DAIRY'		
+  """		
+		
+df_01 = spark.sql(sql_statement_gensim)		
+print(df_01.count()) # 441		
+		
+# COMMAND ----------		
+		
+# df Cheese		
+sql_statement_dimtables = """		
+SELECT df_spark.*		
+		
+FROM 		
+  df_spark  		
+  INNER JOIN  		
+    		
+  file		
+  ON file._c0 = df_spark.article_number		
+  WHERE		
+  --df_spark.category_name = 'CHEESE' AND		
+  df_spark.sm_department_name = 'DAIRY'		
+  """		
+		
+df_02 = spark.sql(sql_statement_dimtables)		
+print(df_02.count()) # 441		
+df_02.createOrReplaceTempView('df_02')		
+df_02_pandas = df_02.toPandas()		
+		
+		
+# COMMAND ----------		
+		
+		
+df_02_pandas = df_02_pandas.astype({'customerValueSUBCAT': 'float', 'customerValueSEGM' : 'float'  })		
+df_02_pandas.dropna(how='all', inplace=True)		
+df_02_pandas = df_02_pandas.sort_values(by=['article_number'])		
+df_02_pandas = df_02_pandas.reset_index()		
+df_02_pandas = df_02_pandas.drop('index',axis=1)		
+df_02_pandas = df_02_pandas.sort_index()		
+print(len(df_02_pandas))		
+df_02_pandas.dtypes		
+		
+# COMMAND ----------		
+		
+# items in current ecommerce assortment but not in cpdna		
+sql_02 = """		
+SELECT df_ecommerce_current.*		
+		
+FROM 		
+  df_ecommerce_current  		
+  LEFT JOIN  		
+  file		
+  		
+  ON file._c0 = df_ecommerce_current.article_number		
+  		
+  WHERE		
+  --df_ecommerce_current.category_name = 'CHEESE' AND		
+  df_ecommerce_current.sm_department_name = 'DAIRY' AND		
+  file._c0 IS NULL		
+  """		
+df_sql_02 = spark.sql(sql_02)		
+print(df_sql_02.count()) #		
+		
+		
+# COMMAND ----------		
+		
+# items in current ecommerce assortment but not in cpdna		
+df_sql_02_pandas = df_sql_02.toPandas()		
+df_sql_02_pandas = df_sql_02_pandas.astype({'customerValueSUBCAT': 'float', 'customerValueSEGM' : 'float'  })		
+df_sql_02_items = df_sql_02_pandas.article_number		
+		
+# COMMAND ----------		
+		
+df_sql_02_pandas		
+		
+# COMMAND ----------		
+		
+# CHANGE PART IF NEW ELEMENT IN FORMULA		
+		
+df_03_pandas = df_02_pandas.append(df_sql_02_pandas , ignore_index = True)		
+print(len(df_03_pandas))		
+df_03_pandas['customerValueSUBCAT'] = round(df_03_pandas['customerValueSUBCAT'],2)		
+df_03_pandas['customerValueSEGM'] = round(df_03_pandas['customerValueSEGM'],2)		
+df_03_pandas['revenue'] = round(df_03_pandas['revenue'],2)		
+df_03_pandas.dropna(how='all', inplace=True)		
+		
+df_03_pandas = df_03_pandas[df_03_pandas['customerValueSUBCAT'].notnull()]		
+df_03_pandas = df_03_pandas[df_03_pandas['customerValueSEGM'].notnull()]		
+df_03_pandas = df_03_pandas[df_03_pandas['distinct_count_customer'].notnull()]		
+df_03_pandas = df_03_pandas[df_03_pandas['revenue'].notnull()]		
+print(len(df_03_pandas))		
+		
+# df_03_pandas[df_03_pandas.customerValueSEGM.isnull()]		
+# print(len(df_03_pandas.customerValueSEGM.dropna()))		
+# print(len(df_03_pandas[df_03_pandas.customerValueSEGM.isnull()]))		
+		
+df_03_pandas.dtypes		
+		
+# COMMAND ----------		
+		
+display(df_03_pandas)		
+		
+# COMMAND ----------		
+		
+# MAGIC %sql		
+# MAGIC -- EDA difference between cheese 444 (DL) and 441 (cpdna)		
+# MAGIC select df_spark.*		
+# MAGIC from df_spark		
+# MAGIC left join df_02		
+# MAGIC on df_spark.article_number = df_02.article_number		
+# MAGIC where df_02.article_number is null		
+		
+# COMMAND ----------		
+		
+# save the filtered-on-cheese file in the Datalake as csv		
+# overwriting by default		
+# space delimited		
+df_01.toPandas().to_csv("/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/cpdna_glove_filtered/cpdna_glove_filtered.csv", sep=" ", index = False, header = False) #ne pas enlever partie /dbfs ici		
+		
+# COMMAND ----------		
+		
+# get the filtered file from Datalake		
+glovePath2 = "/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/cpdna_glove_filtered/cpdna_glove_filtered.csv" 		
+# file2 = spark.read.format('csv').options(sep = " ").load(glovePath2)		
+# file2.createOrReplaceTempView('file2')		
+# display(file2)		
+		
+# COMMAND ----------		
+		
+from gensim.test.utils import datapath, get_tmpfile		
+glovePath3 = "/dbfs"+glovePath2		
+glove_file = datapath(glovePath3)		
+print(type(glove_file))		
+print(glove_file)		
+		
+# COMMAND ----------		
+		
+# convert GloVe vectors into the word2vec. Both files are presented in text format and almost identical except that word2vec includes number of vectors and its dimension which is only difference regard to GloVe.		
+# https://radimrehurek.com/gensim/scripts/glove2word2vec.html		
+from gensim.scripts.glove2word2vec import glove2word2vec		
+		
+tmp_file = get_tmpfile("/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/cpdna_glove_filtered/tmpW2V") # Get full path to file `suffix` in temporary folder.		
+_ = glove2word2vec(glove_file, tmp_file)		
+		
+# COMMAND ----------		
+		
+# load gensim keyedVectors Model		
+from gensim.models import KeyedVectors		
+model_vec = KeyedVectors.load_word2vec_format(tmp_file)		
+		
+# COMMAND ----------		
+		
+# model_vec.vocab		
+		
+# COMMAND ----------		
+		
+from gensim.similarities.index import AnnoyIndexer		
+annoy_index = AnnoyIndexer(model_vec, 100)		
+		
+# COMMAND ----------		
+		
+# function: get topx similar items for a given item in model.vocab and return		
+# it as a list with tuples		
+def topx(x,topx=10):		
+  result= [x]		
+  if x in model_vec.vocab:		
+		
+      distances = model_vec.most_similar(x, topn=topx, indexer=annoy_index)		
+      for entry in distances:		
+        result.append(entry)		
+  else: 		
+      for alt in range(topx):		
+        result.append(("alt1"+str(alt),0.0))		
+  return result		
+		
+# COMMAND ----------		
+		
+# function convert the tuple list objects returned from topx function into nested dictionaries		
+def convert(lst):		
+  dct = {lst[0]: {lst[i][0]: lst[i][1] for i in range(1, len(lst))}}		
+  return dct		
+# dct = convert(list)		
+# print(dct)		
+		
+# COMMAND ----------		
+		
+len_model_vec_vocab = len(model_vec.vocab) 		
+print(len_model_vec_vocab)		
+dct_data = {}		
+for v in model_vec.vocab:		
+  lst = topx(v, len_model_vec_vocab)		
+  dctn = convert(lst)		
+  dct_data.update(dctn)		
+dct_data		
+		
+		
+# COMMAND ----------		
+		
+# convert nested dictionary into Pandas dataframe (double entry table)		
+# ok to leave [i][i] value 1 (warning sometimes 0.99..) in the table, it shouldn't impact the selection		
+de_table = pd.DataFrame(dct_data) #441 x 441 cheese ecomm . 708x708 full assortment cheese 		
+		
+# add manually items that are in the current ecomm assortment but not in the cpdna (a row block and then a column block - with 0.01 values)		
+# 0.01 instead of 0 otherwise cannot use it at denominator level in the objective function		
+for i in df_sql_02_items:		
+  de_table.loc[i] = 0.01		
+  de_table[i] = 0.01		
+		
+		
+de_table = de_table.sort_index(axis=0)		
+de_table = de_table.sort_index(axis=1)		
+de_table = round(de_table,2)		
+de_table		
+		
+# COMMAND ----------		
+		
+print(len(de_table))		
+print(len(de_table.dropna(how='all')))		
+		
+# COMMAND ----------		
+		
+# MAGIC %md		
+# MAGIC PULP MODEL		
+		
+# COMMAND ----------		
+		
+# arrange data for model_pulp		
+		
+# articles = df_02_pandas.article_number.tolist()		
+# revenue_dict = dict(zip(df_02_pandas.article_number,df_02_pandas.revenue)) # revenue per article number in a dictionary		
+# dist_customer_dict = dict(zip(df_02_pandas.article_number,df_02_pandas.distinct_count_customer)) # number of different clients per article number in a dictionary		
+# customer_value_dict = dict(zip(df_02_pandas.article_number,df_02_pandas.customerValueSEGM)) # customer value in a dictionary		
+		
+articles = df_03_pandas.article_number.tolist()		
+revenue_dict = dict(zip(df_03_pandas.article_number,df_03_pandas.revenue)) # revenue per article number in a dictionary		
+dist_customer_dict = dict(zip(df_03_pandas.article_number,df_03_pandas.distinct_count_customer)) # number of different clients per article number in a dictionary		
+customer_value_dict = dict(zip(df_03_pandas.article_number,df_03_pandas.customerValueSEGM)) # customer value in a dictionary		
+		
+# COMMAND ----------		
+		
+# import pulp		
+from pulp import *		
+		
+# initialize pulp class		
+model_pulp7 = LpProblem("Optimize_ecomm_assortment07", LpMaximize)		
+		
+# COMMAND ----------		
+		
+# initialize variables		
+X = LpVariable.dicts('article1', articles , cat = 'Continuous', lowBound=0, upBound=1) # Xi = 1 if article i is selected else 0		
+# X = LpVariable.dicts('article_', [(i,j) for i in articles for j in articles[(articles.index(i)+1):]], cat = 'Binary') 		
+		
+Z = LpVariable.dicts('article2', [(i,j) for i in articles for j in articles], cat = 'Continuous', lowBound=0, upBound=1) 		
+# X = LpVariable.dicts('article_', [(i,j) for i in articles for j in articles[(articles.index(i)+1):]], cat = 'Binary') # Xi = 1 if article i is selected else 0		
+		
+# COMMAND ----------		
+		
+# define objective function		
+model_pulp7 += lpSum([ (w1*revenue_dict[i] + w2*dist_customer_dict[i] + w3*customer_value_dict[i])   *X[i] for i in articles]) - lpSum([ w4*de_table[i][j] *Z[(i,j)] for i in articles for j in articles ])		
+		
+# + w4*(lpSum([de_table[i][j] * X[j] for j in articles]))		
+		
+# articles[(articles.index(i)+1):] so X[a][b] and X[b][a] won't be double counted, and also it won't take into account X[a][a] (even if it wouldn't have an impact on the optimization I think, but it improves performance)		
+# model_pulp += lpSum([   (   (dist_customer_dict[i]*revenue_dict[i] + dist_customer_dict[j]*revenue_dict[j]) / de_table[i][j]     )  *X[(i,j)] for i in articles for j in articles[(articles.index(i)+1):]        ]) 		
+# model_pulp += lpSum([    (   (dist_customer_dict[i]*revenue_dict[i]) / de_table[i][j] ) *X[i]+X[j]          for i in articles for j in articles[(articles.index(i)+1):]   ]) 		
+		
+# COMMAND ----------		
+		
+# define constraints		
+model_pulp7 += lpSum([X[i] for i in articles]) ==  size_ecomm   # -1 pcq ex 2 paires ac ad:acd 3 items (plus compliqué en fait). # number max of products in the assortment # keep <= for constraint		
+model_pulp7 += lpSum([Z[(i,j)] for i in articles for j in articles]) >=  lpSum([X[i] for i in articles])		
+model_pulp7 += lpSum([Z[(i,j)] for i in articles for j in articles]) <=  lpSum([X[i] + X[j] - 1 for i in articles for j in articles])		
+		
+# COMMAND ----------		
+		
+# solve model		
+#  Pulp: Error while executing /local_disk0/pythonVirtualEnvDirs/virtualEnv-c4b5dfdd-8d88-4eee-8dc9-5c937d827fe6/lib/python3.7/site-packages/pulp/apis/../solverdir/cbc/linux/64/cbc		
+#  Problem was linked to a nan value in customer value (cold belinked to duplicates in varaibles also not in this case) https://stackoverflow.com/questions/27406858/pulp-solver-error		
+LpSolverDefault.msg = 1 # Setting LpSolverDefault.msg = 1 before calling prob.solve() may help by printing the solvers output to the console.		
+# try:		
+model_pulp7.solve()  #1.35 min #6.49 #dairy binary 90min #continuous 41min weights 40min		
+# except:		
+#   print("oo")		
+#   a = model_pulp.writeMPS('/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/assortment/errormps.mps')		
+# #   print(a)		
+		
+# COMMAND ----------		
+		
+#check if continuous variable values are 1 and 0s or ROUND if close enough to 0 or 1		
+for i in articles:		
+#   print(X[i].varValue)		
+  if X[i].varValue not in [0,1]:		
+    print(X[i].varValue)		
+    if X[i].varValue < 0.1 or X[i].varValue >0.9:		
+      X[i].varValue = round(X[i].varValue)		
+      print(X[i].varValue)		
+		
+# COMMAND ----------		
+		
+# list_selection = [a for a in articles if X_nlp[a].solution_value == 1] # same as the one output from PuLP		
+list_selection = [i for i in articles if X[i].varValue == 1] # same as the one output from PuLP		
+print(len(list_selection))		
+print(type(list_selection))		
+list_selection.sort()		
+list_selection		
+		
+# COMMAND ----------		
+		
+# pd.set_option('display.max_rows', None)		
+# pd.set_option('display.max_columns', None)		
+		
+# COMMAND ----------		
+		
+# get the sum of similarities of all the selected items per item		
+aaa = list(de_table.index)		
+dict_sim_sum = dict.fromkeys(aaa, 0)		
+for i in aaa:		
+  for j in aaa:		
+#     if X[i].varValue == 1 and X[j].varValue == 1:     # KeyError: 'F2015092500121810000'		
+      dict_sim_sum[i] += de_table[i][j]		
+#   dict_sim_sum[i] += -1*X_nlp[i].solution_value		
+dict_sim_sum		
+		
+# COMMAND ----------		
+		
+# mapping IN/OUT		
+articles_pandas = pd.DataFrame(articles, columns= ['article_number'])		
+# articles_pandas['IN/OUT'] = ['IN' if X[x].varValue == 1 else 'OUT' for x in articles_pandas.article_number]		
+articles_pandas['IN/OUT'] = ['IN' if X[i].varValue == 1 else 'OUT' for i in articles_pandas.article_number]		
+print(articles_pandas[articles_pandas['IN/OUT']=='IN'].count())		
+		
+# COMMAND ----------		
+		
+# integrate results in initial dataset		
+df_merged = pd.merge(df_03_pandas, articles_pandas, how= 'left', on = 'article_number')		
+# df_merged.head()		
+		
+# COMMAND ----------		
+		
+df_merged.to_csv("/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/assortment/df_merged.csv", sep=",", decimal= '.', index = False, header = True)		
+		
+		
+# COMMAND ----------		
+		
+# CHANGE PART IF NEW ELEMENT IN FORMULA		
+df_merged['sum_similarities'] = df_merged['article_number'].map(dict_sim_sum)		
+df_merged['obj_function'] = df_merged.revenue + df_merged.distinct_count_customer + df_merged.customerValueSEGM - df_merged.sum_similarities		
+df_merged['obj_function_w'] = w1*df_merged.revenue + w2*df_merged.distinct_count_customer + w3*df_merged.customerValueSEGM - w4*df_merged.sum_similarities		
+df_merged = df_merged.sort_values(by='obj_function_w', ascending=False)		
+df_merged		
+		
+# COMMAND ----------		
+		
+df_final = df_merged[df_merged['IN/OUT']=='IN']		
+		
+		
+df_final = df_final.reset_index()		
+df_final = df_final.drop('index',axis=1)		
+df_final = df_final.sort_index()		
+print(len(df_final))		
+df_final		
+# to fix the warning https://www.dataquest.io/blog/settingwithcopywarning/ 		
+# 3 last ones at zeros. It can be explained by the similarity by pairs. ex      (1000*1000 + 0*10)/0,1    is still bigger than     (1000*1000 + 10*10)/ 1		
+		
+# COMMAND ----------		
+		
+# CHANGE PART IF NEW ELEMENT IN FORMULA		
+# on recoupe le montant de la obj function (voir docplex) ici score toal weighted est bien = à la moyenne de ce montant		
+# features importance, variables evaluaitons, weights		
+# ON MEANS - montants différents des scores du coup, et aussi on fait la moyenne sur 722 pas idéal à mon avis		
+# il faut d'abord runner avec tous les weights à 1 , parce que après les weights sont déjà intégrés dans obj_function.mean et on a plus 100% (j'ai rajouté une col obj function non weighted)		
+# faire ça que sur les 'IN' c'est plus simple pour substituability etpour recouper les données		
+		
+impact1 = round(df_final.revenue.mean() / df_final.obj_function.mean() ,2)		
+impact2 = round(df_final.distinct_count_customer.mean() / df_final.obj_function.mean() ,2)		
+impact3 = round(df_final.customerValueSEGM.mean() / df_final.obj_function.mean() ,6)		
+impact4 = - round(df_final.sum_similarities.mean() / df_final.obj_function.mean() ,6)		
+		
+impact_tot = impact1 + impact2 + impact3 + impact4		
+		
+impact1_w = round(w1*df_final.revenue.mean() / df_final.obj_function_w.mean(),2)		
+impact2_w = round(w2*df_final.distinct_count_customer.mean() / df_final.obj_function_w.mean(),2)		
+impact3_w = round(w3*df_final.customerValueSEGM.mean() / df_final.obj_function_w.mean(),2)		
+impact4_w = - round(w4*df_final.sum_similarities.mean() / df_final.obj_function_w.mean(),2)		
+		
+impact_tot_w = impact1_w + impact2_w + impact3_w + impact4_w		
+		
+print("revenue: " + "\t" + "\t" + "\t" +  str(round(df_final.revenue.mean()))   + "\t\t" + str(impact1) + "\t\t" +  str(round(w1*df_final.revenue.mean()))   + "\t\t" + str(impact1_w)   )      # f"{results:,d}" )		
+print("distinct_count_customer: " + "\t" + str(round(df_final.distinct_count_customer.mean())) + "\t\t" +  str(impact2) + "\t\t"   +str(round(w2*df_final.distinct_count_customer.mean()))+ "\t\t" + str(impact2_w))		
+print("customer value: " + "\t\t" +   str(round(df_final.customerValueSEGM.mean()))   + "\t\t" + str(impact3) + "\t\t"  + str(round(w3*df_final.customerValueSEGM.mean()))+ "\t\t" + str(impact3_w))		
+print("similarities coeff: " + "\t" + "\t" +  str(round(-df_final.sum_similarities.mean()))   + "\t\t" + str(impact4) + "\t"  + str(round(-w4*df_final.sum_similarities.mean()))+ "\t" + str(impact4_w))		
+		
+print("score total" + "\t" + "\t" + "\t" + str(round(df_final.obj_function.mean())) + "\t\t"+  str(round(impact_tot)) +  "\t\t"+str(round(df_final.obj_function_w.mean()))+ "\t\t" + str(round(impact_tot_w)))		
+		
+# results = lpSum([      (w1*revenue_dict[i] + w2*dist_customer_dict[i] + w3*customer_value_dict[i]      )  *X_nlp[i].solution_value for i in articles         ])		
+		
+# COMMAND ----------		
+		
+# items in Scanned items but not in cpdna		
+# the 3 significant ones revenue speaking are the ones that are in the ecommerce below 		
+sql_01 = """		
+SELECT df_spark.*		
+		
+FROM 		
+  df_spark  		
+  LEFT JOIN  		
+  file		
+  		
+  ON file._c0 = df_spark.article_number		
+  		
+  WHERE		
+  --df_spark.category_name = 'CHEESE' AND		
+  df_spark.sm_department_name = 'DAIRY' AND		
+  file._c0 IS NULL		
+  """		
+		
+df_sql_01 = spark.sql(sql_01)		
+print(df_sql_01.count()) #8		
+display(df_sql_01)		
+		
+# COMMAND ----------		
+		
+# items in current ecommerce assortment but not in cpdna		
+# Ce sont des produits promopacks en gros, des packaging speciaux (ici +20%) ouverts temporairement et jusqu'à épuisement des stocks sur delhaize.be		
+display(df_sql_02) #		
+		
+# COMMAND ----------		
+		
+# arrange data for comparison with current ecomm assortment - No take also offline figures		
+df_ecommerce_current_pandas = df_ecommerce_current.toPandas()		
+df_ecommerce_current_pandas.dropna(how='all', inplace=True)		
+df_ecommerce_current_pandas = df_ecommerce_current_pandas.astype({'customerValueSUBCAT': 'float', 'customerValueSEGM' : 'float'  })		
+current_list = df_ecommerce_current_pandas.article_number.tolist()		
+# revenue_dict_current = dict(zip(df_ecommerce_current_pandas.article_number,df_ecommerce_current_pandas.revenue)) # revenue per article number in a dictionary		
+# dist_customer_dict_current = dict(zip(df_ecommerce_current_pandas.article_number,df_ecommerce_current_pandas.distinct_count_customer)) # number of different clients per article number in a dictionary		
+		
+		
+# COMMAND ----------		
+		
+df_ecommerce_current_pandas		
+		
+# COMMAND ----------		
+		
+print(len(current_list))		
+		
+# COMMAND ----------		
+		
+current_list2 = [x for x in current_list if x not in df_sql_02_pandas.article_number.tolist()]  		
+len(current_list2)		
+		
+# COMMAND ----------		
+		
+# CHANGE PART IF NEW ELEMENT IN FORMULA		
+# baselining		
+# results of the optimized objective function		
+# results = lpSum([dist_customer_dict[i]*revenue_dict[i]*X[i].varValue for i in articles])		
+# results = lpSum([ (   dist_customer_dict[i]*revenue_dict[i] + dist_customer_dict[j]*revenue_dict[j])  *X[(i,j)].varValue for i in articles for j in articles[(articles.index(i)+1):]        ])		
+# results = lpSum([   (   (dist_customer_dict[i]*revenue_dict[i] + dist_customer_dict[j]*revenue_dict[j]) / de_table[i][j]     )  *X[(i,j)].varValue for i in articles for j in articles[(articles.index(i)+1):]        ])		
+# results = lpSum([      (w1*revenue_dict[i] + w2*dist_customer_dict[i] + w3*customer_value_dict[i]      )  *X[i].varValue for i in articles         ])		
+results = sum(   (w1*revenue_dict[i]  + w2*dist_customer_dict[i] + w3*customer_value_dict[i])   *X[i].varValue for i in articles) - sum( w4*de_table[i][j] *Z[(i,j)].varValue for i in articles for j in articles )		
+		
+# X_nlp[a].solution_value		
+# mdl.minimize(mdl.sum(   (-w1*revenue_dict[i] - w2*dist_customer_dict[i] - w3*customer_value_dict[i] - w4* ( mdl.sum(de_table[i][j] *X_nlp[j] for j in articles)) -1  )   *X_nlp[i] for i in articles    )) 		
+		
+print(type(results))		
+results = round(float(str(results)))		
+		
+print(f"{results:,d}")		
+print(type(f"{results:,d}"))		
+		
+		
+		
+# COMMAND ----------		
+		
+		
+		
+# COMMAND ----------		
+		
+df_final.article_number		
+				
+		
+# COMMAND ----------		
+		
+# CHANGE PART IF NEW ELEMENT IN FORMULA		
+# comparison of our objective function results with ecommerce current assortment input in the obj function (so eccomerce assortment BUT with Offline sales, so we compare apples with apples)		
+		
+		
+# revenue_dict2 = dict(zip(df_03_pandas.article_number,df_03_pandas.revenue)) # revenue per article number in a dictionary		
+# dist_customer_dict2 = dict(zip(df_03_pandas.article_number,df_03_pandas.distinct_count_customer)) # number of different clients per article number in a dictionary		
+		
+		
+# results_ecommerce_current = lpSum([   (   (dist_customer_dict[i]*revenue_dict[i] + dist_customer_dict[j]*revenue_dict[j]) / de_table[i][j]     )  for i in current_list2 for j in current_list2[(current_list2.index(i)+1):]  ])		
+# results_ecommerce_current = lpSum([      w1*revenue_dict[i] + w2*dist_customer_dict[i] + w3*customer_value_dict[i]        for i in current_list   ])		
+		
+results_ecommerce_current = sum(   (w1*revenue_dict[i]  + w2*dist_customer_dict[i] + w3*customer_value_dict[i])    for i in current_list) - sum( w4*de_table[i][j]  for i in current_list for j in current_list )		
+		
+results_ecommerce_current = round(float(str(results_ecommerce_current)))		
+# print(results_ecommerce_current)		
+# print()		
+print("our selection: " + f"{results:,d}" )		
+print("current selection: " + f"{results_ecommerce_current:,d}")		
+		
+# COMMAND ----------		
+		
+# #IN BOTH OUR SELECTION AND ECOMM CURRENT SELECTION		
+# both_selections = df_final[df_final['article_number'].isin(current_list)]		
+# print(len(both_selections))		
+# both_selections		
+		
+# COMMAND ----------		
+		
+#IN ECOMM CURRENT SELECTION AND NOT IN OUR SELECTION		
+not_our_selection = df_ecommerce_current_pandas[~df_ecommerce_current_pandas['article_number'].isin(list_selection)]		
+print(len(not_our_selection))		
+not_our_selection		
+		
+# COMMAND ----------		
+		
+#IN OUR SELECTION AND NOT IN ECOMM CURRENT SELECTION		
+not_ecomm_selection = df_final[~df_final['article_number'].isin(current_list)]		
+print(len(not_ecomm_selection))		
+not_ecomm_selection		
+		
+# COMMAND ----------		
+		
+#subcategory_syllab comparison between current ecomm and our selection		
+our_selection_distribution01 = pd.DataFrame(df_merged.groupby('subcategory_syllab')['IN/OUT'].agg( lambda x: x[x =='IN'].count()   ).reset_index(name='num_items_selected')  )  #if df_final['IN/OUT'] == 'IN')		
+our_selection_distribution01['% of total (selected)'] = round(our_selection_distribution01.num_items_selected / len(df_final) *100,0)		
+		
+ecomm_selection_distribution01 = pd.DataFrame(df_ecommerce_current_pandas.groupby('subcategory_syllab')['article_number'].agg( lambda x: x.count()   ).reset_index(name='num_items_selected_ecomm')  ) 		
+ecomm_selection_distribution01['% of total (ecomm)'] = round(ecomm_selection_distribution01.num_items_selected_ecomm / len(df_ecommerce_current_pandas) *100,0)		
+		
+		
+df_comparison01 = pd.merge(our_selection_distribution01, ecomm_selection_distribution01, how='left', on='subcategory_syllab')		
+df_comparison01[['num_items_selected_ecomm', '% of total (ecomm)']] = df_comparison01[['num_items_selected_ecomm', '% of total (ecomm)']].fillna(0)		
+df_comparison01['Diff']=df_comparison01['num_items_selected_ecomm'] - df_comparison01['num_items_selected']		
+df_comparison01['Diff_%']=round(df_comparison01['Diff']/df_comparison01['num_items_selected']*100,2)		
+df_comparison01		
+		
+# COMMAND ----------		
+		
+ax11 = df_comparison01.plot(x= 'subcategory_syllab', y = ['num_items_selected','num_items_selected_ecomm'],kind='bar', title="# items per subcategory_syllab") #figsize=(14,8),		
+ax11.set_xlabel("subcategory_syllab")		
+ax11.set_ylabel("# items")		
+display(ax11)		
+		
+# COMMAND ----------		
+		
+# https://matplotlib.org/3.1.0/gallery/subplots_axes_and_figures/subplots_demo.html		
+import matplotlib.pyplot as plt		
+fig1, (ax12, ax13) = plt.subplots(2)		
+fig1.suptitle('# items per subcategory_syllab')		
+ax12.pie(df_comparison01['num_items_selected'], labels=df_comparison01['subcategory_syllab'] )		
+ax12.set_title("our selection")		
+ax13.pie(df_comparison01['num_items_selected_ecomm'], labels=df_comparison01['subcategory_syllab'] )		
+ax13.set_title("ecomm selection")		
+# ax.set_xlabel("subcategory_syllab")		
+# ax.set_ylabel("# items")		
+# bar_width = 0.4		
+# ax3.bar(x= df_comparison01['subcategory_syllab'], height = df_comparison01['num_items_selected_ecomm'], width=bar_width) 		
+# ax3.bar(x= df_comparison01['subcategory_syllab'], height = df_comparison01['num_items_selected'], width=bar_width)  		
+# ax3.set_xlabel("subcategory_syllab")		
+# ax3.set_ylabel("# items")		
+		
+		
+display(fig1)		
+		
+# COMMAND ----------		
+		
+#segment_syllab comparison between current ecomm and our selection		
+our_selection_distribution02 = pd.DataFrame(df_merged.groupby('segment_syllab')['IN/OUT'].agg( lambda x: x[x =='IN'].count()   ).reset_index(name='num_items_selected')  )  #if df_final['IN/OUT'] == 'IN')		
+our_selection_distribution02['% of total (selected)'] = round(our_selection_distribution02.num_items_selected / len(df_final) *100,0)		
+		
+ecomm_selection_distribution02 = pd.DataFrame(df_ecommerce_current_pandas.groupby('segment_syllab')['article_number'].agg( lambda x: x.count()   ).reset_index(name='num_items_selected_ecomm')  ) 		
+ecomm_selection_distribution02['% of total (ecomm)'] = round(ecomm_selection_distribution02.num_items_selected_ecomm / len(df_ecommerce_current_pandas) *100,0)		
+		
+		
+df_comparison02 = pd.merge(our_selection_distribution02, ecomm_selection_distribution02, how='left', on='segment_syllab')		
+df_comparison02[['num_items_selected_ecomm', '% of total (ecomm)']] = df_comparison02[['num_items_selected_ecomm', '% of total (ecomm)']].fillna(0)		
+df_comparison02['Diff']=df_comparison02['num_items_selected_ecomm'] - df_comparison02['num_items_selected']		
+df_comparison02['Diff_%']=round(df_comparison02['Diff']/df_comparison02['num_items_selected']*100,2)		
+df_comparison02		
+		
+# COMMAND ----------		
+		
+ax21 = df_comparison02.plot(x= 'segment_syllab', y = ['num_items_selected','num_items_selected_ecomm'],kind='bar', title="# items per segment_syllab") #figsize=(14,8),		
+ax21.set_xlabel("segment_syllab")		
+ax21.set_ylabel("# items")		
+display(ax21)		
+		
+	
+		
